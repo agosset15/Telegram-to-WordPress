@@ -1,8 +1,9 @@
 import logging
+import re
 from datetime import date, time
 
 from aiogram import Router, F, Bot
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
@@ -23,36 +24,84 @@ logger = logging.getLogger(__name__)
 _MORE_MARKER = "###"
 _MORE_TAG = "<!--more--><br>"
 
+_TAG_RE = re.compile(r"<[^>]+>")
+
+# Bot API отдаёт на скачивание (getFile) файлы не больше 20 МБ
+MAX_TG_FILE = 20 * 1024 * 1024
+
 
 def _kb(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=list(rows))
 
 
-async def _photo_url(bot: Bot, msg: Message) -> str:
-    file = await bot.get_file(msg.photo[-1].file_id)
+def _split_title_body(html: str) -> tuple[str, str]:
+    """Заголовок = первый абзац (до пустой строки, иначе первая строка),
+    тело = остаток. Из заголовка убираем HTML-теги (WP-заголовок — текст)."""
+    html = html.strip()
+    if "\n\n" in html:
+        head, body = html.split("\n\n", 1)
+    else:
+        head, _, body = html.partition("\n")
+    title = _TAG_RE.sub("", head).strip()
+    return title, body.strip()
+
+
+async def _file_url(bot: Bot, file_id: str) -> str:
+    file = await bot.get_file(file_id)
     return f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
 
 
-async def _store_photos(
+async def _collect_media(
     message: Message,
     state: FSMContext,
     bot: Bot,
     album: list[Message] | None,
 ) -> bool:
-    """Сохраняет фото из одиночного сообщения или альбома в FSM.
-    Возвращает False, если фото получить не удалось."""
-    photos = [m for m in (album or [message]) if m.photo]
-    if not photos:
+    """Собирает фото/видео из сообщения или альбома в data['media'].
+    Видео крупнее лимита Bot API (20 МБ на скачивание) пропускает.
+    Возвращает False, если сохранять нечего."""
+    media: list[dict] = []
+    skipped = 0
+    for m in album or [message]:
+        if m.photo:
+            url = await _file_url(bot, m.photo[-1].file_id)
+            media.append(
+                {"url": url, "kind": "image", "filename": "image.jpg", "mime": "image/jpeg"}
+            )
+        elif m.video:
+            v = m.video
+            if v.file_size and v.file_size > MAX_TG_FILE:
+                skipped += 1
+                continue
+            url = await _file_url(bot, v.file_id)
+            media.append(
+                {
+                    "url": url,
+                    "kind": "video",
+                    "filename": v.file_name or "video.mp4",
+                    "mime": v.mime_type or "video/mp4",
+                }
+            )
+
+    if skipped:
+        await message.answer(
+            f"Пропущено видео: {skipped} шт. больше 20 МБ — "
+            "Bot API не отдаёт такие файлы на скачивание."
+        )
+    if not media:
         return False
 
-    urls = [await _photo_url(bot, m) for m in photos]
-    if len(urls) > 1:
-        await state.update_data(image=urls[0], album_urls=urls)
-        await message.answer(
-            f"Получено {len(urls)} фото — будут опубликованы галереей под текстом."
-        )
-    else:
-        await state.update_data(image=urls[0])
+    await state.update_data(media=media)
+
+    imgs = sum(1 for x in media if x["kind"] == "image")
+    vids = len(media) - imgs
+    if len(media) > 1 or vids:
+        parts = []
+        if imgs:
+            parts.append(f"{imgs} фото")
+        if vids:
+            parts.append(f"{vids} видео")
+        await message.answer("Получено: " + ", ".join(parts) + " — добавлю под текстом.")
     return True
 
 
@@ -104,6 +153,55 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Быстрый пост — прислали текст/медиа без активного диалога
+# ---------------------------------------------------------------------------
+
+@router.message(StateFilter(None), F.text & ~F.text.startswith("/"))
+async def quick_post_text(message: Message, state: FSMContext) -> None:
+    if message.from_user.id not in ALLOWED_USERS:
+        await message.answer("У вас нет доступа к публикации.")
+        return
+
+    raw = (message.html_text or message.text or "").replace(_MORE_MARKER, _MORE_TAG)
+    title, body = _split_title_body(raw)
+    if not title:
+        await message.answer("Не удалось определить заголовок. Отправьте текст поста.")
+        return
+
+    await state.update_data(title=title, body=body)
+    await message.answer(f"Заголовок: <b>{title}</b>")
+    await _ask_publish(message, state)
+
+
+@router.message(StateFilter(None), F.photo | F.video)
+async def quick_post_media(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    album: list[Message] | None = None,
+) -> None:
+    if message.from_user.id not in ALLOWED_USERS:
+        await message.answer("У вас нет доступа к публикации.")
+        return
+
+    # подпись Telegram прикрепляет к первому фото группы (мин. message_id)
+    src = min(album, key=lambda m: m.message_id) if album else message
+    raw = (src.html_text or src.caption or "").replace(_MORE_MARKER, _MORE_TAG)
+    title, body = _split_title_body(raw)
+    if not title:
+        await message.answer("Добавьте подпись к медиа — первый абзац станет заголовком.")
+        return
+
+    await state.update_data(title=title, body=body)
+    if not await _collect_media(message, state, bot, album):
+        await message.answer("Не удалось получить медиа. Попробуйте ещё раз.")
+        return
+
+    await message.answer(f"Заголовок: <b>{title}</b>")
+    await _ask_publish(message, state)
+
+
+# ---------------------------------------------------------------------------
 # Шаг 1 — Заголовок
 # ---------------------------------------------------------------------------
 
@@ -136,22 +234,22 @@ async def get_body(message: Message, state: FSMContext) -> None:
     await state.set_state(Post.image)
 
 
-@router.message(Post.body, F.photo)
+@router.message(Post.body, F.photo | F.video)
 async def get_body_with_media(
     message: Message,
     state: FSMContext,
     bot: Bot,
     album: list[Message] | None = None,
 ) -> None:
-    """Текст поста прислали сразу с фото/альбомом: подпись = тело поста,
-    фото запоминаем, шаг Post.image пропускаем."""
-    # подпись Telegram прикрепляет к первому фото группы (мин. message_id)
+    """Текст поста прислали сразу с медиа/альбомом: подпись = тело поста,
+    медиа запоминаем, шаг Post.image пропускаем."""
+    # подпись Telegram прикрепляет к первому элементу группы (мин. message_id)
     src = min(album, key=lambda m: m.message_id) if album else message
     raw = (src.html_text or src.caption or "").replace(_MORE_MARKER, _MORE_TAG)
     await state.update_data(body=raw)
 
-    if not await _store_photos(message, state, bot, album):
-        await message.answer("Не удалось получить фото. Попробуйте ещё раз.")
+    if not await _collect_media(message, state, bot, album):
+        await message.answer("Не удалось получить медиа. Попробуйте ещё раз.")
         return
 
     await _ask_publish(message, state)
@@ -161,15 +259,15 @@ async def get_body_with_media(
 # Шаг 5 — Изображение
 # ---------------------------------------------------------------------------
 
-@router.message(Post.image, F.photo)
+@router.message(Post.image, F.photo | F.video)
 async def get_image(
     message: Message,
     state: FSMContext,
     bot: Bot,
     album: list[Message] | None = None,
 ) -> None:
-    if not await _store_photos(message, state, bot, album):
-        await message.answer("Не удалось получить фото из альбома.")
+    if not await _collect_media(message, state, bot, album):
+        await message.answer("Не удалось получить медиа. Попробуйте ещё раз.")
         return
 
     await _ask_publish(message, state)
@@ -177,7 +275,7 @@ async def get_image(
 
 @router.message(Post.image)
 async def image_wrong_type(message: Message) -> None:
-    await message.answer("Пожалуйста, отправьте <b>фото</b> (не файл/документ).")
+    await message.answer("Пожалуйста, отправьте <b>фото</b> или <b>видео</b> (не файл/документ).")
 
 
 # ---------------------------------------------------------------------------
