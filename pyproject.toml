@@ -1,0 +1,11 @@
+[project]
+name = "telegram-to-wordpress"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.28.2",
+    "cachetools>=7.1.4",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.2",
+]
