@@ -94,8 +94,12 @@ async def upload_image_to_wp(image_url: str) -> dict | None:
     Скачивает изображение из Telegram CDN и загружает в WordPress.
     Возвращает {'id': int, 'source_url': str} или None при ошибке.
     """
+    # WordPress генерирует превью при загрузке медиа — ответ может прийти
+    # позже дефолтных 5s httpx, из-за чего возникал ReadTimeout (с пустым
+    # текстом) уже ПОСЛЕ успешного сохранения файла на сервере.
+    timeout = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0)
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("GET", image_url) as img_resp:
                 img_resp.raise_for_status()
                 image_data = await img_resp.aread()
@@ -109,7 +113,7 @@ async def upload_image_to_wp(image_url: str) -> dict | None:
             result = upload_resp.json()
             return {"id": result["id"], "source_url": result["source_url"]}
     except Exception as e:
-        logger.error("Ошибка загрузки изображения: %s", e)
+        logger.error("Ошибка загрузки изображения [%s]: %s", type(e).__name__, e)
         return None
 
 
@@ -158,18 +162,11 @@ async def post_to_wp(data: dict, publish_now: bool) -> dict:
         featured_id = item["id"]
         content = data.get("body", "")
 
-    existing_tags = await _get_all_tags()
-    tag_ids: list[int] = []
-    for tag_name in data.get("tags", []):
-        tag_id = await _resolve_tag(tag_name, existing_tags)
-        if tag_id is not None:
-            tag_ids.append(tag_id)
-
     post_data: dict = {
         "title": data.get("title", ""),
         "content": content,
-        "categories": [int(data["category"])],
-        "tags": tag_ids,
+        "categories": [1], # 1 — ID категории "Новости"
+        "tags": [],
         "featured_media": featured_id,
         "status": "publish" if publish_now else "future",
     }

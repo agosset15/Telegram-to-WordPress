@@ -12,7 +12,7 @@ class AlbumMiddleware(BaseMiddleware):
     Все последующие сообщения той же группы молча отбрасываются.
     """
 
-    def __init__(self, latency: float = 0.3) -> None:
+    def __init__(self, latency: float = 1.0) -> None:
         self.latency = latency
         self._cache: dict[str, list[Message]] = {}
 
@@ -33,6 +33,11 @@ class AlbumMiddleware(BaseMiddleware):
             # остальные сообщения группы обработает первое
             return
 
+        # Telegram присылает части альбома отдельными апдейтами, нередко
+        # с интервалом в несколько сотен мс. Ждём, пока придут все, иначе
+        # альбом «схлопнется» до первого фото.
         await asyncio.sleep(self.latency)
-        data["album"] = self._cache.pop(gid)
+        album = self._cache.pop(gid)
+        album.sort(key=lambda m: m.message_id)
+        data["album"] = album
         return await handler(event, data)

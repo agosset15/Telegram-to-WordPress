@@ -14,7 +14,7 @@ from aiogram.types import (
 from config import ALLOWED_USERS
 from middleware import AlbumMiddleware
 from states import Post
-from utils import get_wp_categories, post_to_wp
+from utils import post_to_wp
 
 router = Router()
 router.message.outer_middleware(AlbumMiddleware())
@@ -26,6 +26,45 @@ _MORE_TAG = "<!--more--><br>"
 
 def _kb(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=list(rows))
+
+
+async def _photo_url(bot: Bot, msg: Message) -> str:
+    file = await bot.get_file(msg.photo[-1].file_id)
+    return f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
+
+
+async def _store_photos(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    album: list[Message] | None,
+) -> bool:
+    """Сохраняет фото из одиночного сообщения или альбома в FSM.
+    Возвращает False, если фото получить не удалось."""
+    photos = [m for m in (album or [message]) if m.photo]
+    if not photos:
+        return False
+
+    urls = [await _photo_url(bot, m) for m in photos]
+    if len(urls) > 1:
+        await state.update_data(image=urls[0], album_urls=urls)
+        await message.answer(
+            f"Получено {len(urls)} фото — будут опубликованы галереей под текстом."
+        )
+    else:
+        await state.update_data(image=urls[0])
+    return True
+
+
+async def _ask_publish(message: Message, state: FSMContext) -> None:
+    await message.answer(
+        "Когда опубликовать?",
+        reply_markup=_kb(
+            [InlineKeyboardButton(text="Опубликовать сейчас", callback_data="pub:now")],
+            [InlineKeyboardButton(text="Запланировать", callback_data="pub:schedule")],
+        ),
+    )
+    await state.set_state(Post.publish)
 
 
 # ---------------------------------------------------------------------------
@@ -93,72 +132,29 @@ async def get_body(message: Message, state: FSMContext) -> None:
 
     await state.update_data(body=raw)
 
-    try:
-        categories = await get_wp_categories()
-    except Exception as e:
-        logger.error("Ошибка загрузки категорий: %s", e)
-        await message.answer("Не удалось загрузить категории. Попробуйте позже.")
-        return
-
-    if not categories:
-        await message.answer("Список категорий пуст. Проверьте настройки WordPress.")
-        return
-
-    keyboard = _kb(
-        *[
-            [InlineKeyboardButton(text=name, callback_data=f"cat:{cat_id}")]
-            for cat_id, name in categories.items()
-        ]
-    )
-    await message.answer("Выберите <b>категорию</b>:", reply_markup=keyboard)
-    await state.set_state(Post.category)
-
-
-# ---------------------------------------------------------------------------
-# Шаг 3 — Категория
-# ---------------------------------------------------------------------------
-
-@router.callback_query(Post.category, F.data.startswith("cat:"))
-async def get_category(callback: CallbackQuery, state: FSMContext) -> None:
-    cat_id = callback.data.split(":", 1)[1]
-    categories = await get_wp_categories()
-
-    if cat_id not in categories:
-        await callback.answer("Категория не найдена, попробуйте ещё раз.", show_alert=True)
-        return
-
-    await state.update_data(category=cat_id)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        f"Категория: <b>{categories[cat_id]}</b>\n\n"
-        "Введите <b>теги</b> через запятую или нажмите «Пропустить»:",
-        reply_markup=_kb(
-            [InlineKeyboardButton(text="Пропустить", callback_data="tags:skip")]
-        ),
-    )
-    await state.set_state(Post.tags)
-    await callback.answer()
-
-
-# ---------------------------------------------------------------------------
-# Шаг 4 — Теги
-# ---------------------------------------------------------------------------
-
-@router.callback_query(Post.tags, F.data == "tags:skip")
-async def skip_tags(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(tags=[])
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("Прикрепите <b>изображение</b> для обложки поста:")
-    await state.set_state(Post.image)
-    await callback.answer()
-
-
-@router.message(Post.tags, F.text)
-async def get_tags(message: Message, state: FSMContext) -> None:
-    tags = [t.strip() for t in message.text.split(",") if t.strip()]
-    await state.update_data(tags=tags)
     await message.answer("Прикрепите <b>изображение</b> для обложки поста:")
     await state.set_state(Post.image)
+
+
+@router.message(Post.body, F.photo)
+async def get_body_with_media(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    album: list[Message] | None = None,
+) -> None:
+    """Текст поста прислали сразу с фото/альбомом: подпись = тело поста,
+    фото запоминаем, шаг Post.image пропускаем."""
+    # подпись Telegram прикрепляет к первому фото группы (мин. message_id)
+    src = min(album, key=lambda m: m.message_id) if album else message
+    raw = (src.html_text or src.caption or "").replace(_MORE_MARKER, _MORE_TAG)
+    await state.update_data(body=raw)
+
+    if not await _store_photos(message, state, bot, album):
+        await message.answer("Не удалось получить фото. Попробуйте ещё раз.")
+        return
+
+    await _ask_publish(message, state)
 
 
 # ---------------------------------------------------------------------------
@@ -172,32 +168,11 @@ async def get_image(
     bot: Bot,
     album: list[Message] | None = None,
 ) -> None:
-    async def _get_url(msg: Message) -> str:
-        file = await bot.get_file(msg.photo[-1].file_id)
-        return f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
+    if not await _store_photos(message, state, bot, album):
+        await message.answer("Не удалось получить фото из альбома.")
+        return
 
-    if album:
-        photos = [msg for msg in album if msg.photo]
-        if not photos:
-            await message.answer("Не удалось получить фото из альбома.")
-            return
-        urls = [await _get_url(msg) for msg in photos]
-        await state.update_data(image=urls[0], album_urls=urls)
-        await message.answer(
-            f"Получено {len(urls)} фото — будут опубликованы галереей под текстом."
-        )
-    else:
-        url = await _get_url(message)
-        await state.update_data(image=url)
-
-    await message.answer(
-        "Когда опубликовать?",
-        reply_markup=_kb(
-            [InlineKeyboardButton(text="Опубликовать сейчас", callback_data="pub:now")],
-            [InlineKeyboardButton(text="Запланировать", callback_data="pub:schedule")],
-        ),
-    )
-    await state.set_state(Post.publish)
+    await _ask_publish(message, state)
 
 
 @router.message(Post.image)
