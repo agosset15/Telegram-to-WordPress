@@ -12,12 +12,12 @@ from aiogram.types import (
     Message,
 )
 
-from config import ALLOWED_USERS
-from middleware import AlbumMiddleware
+from middleware import AccessMiddleware, AlbumMiddleware
 from states import Post
 from utils import post_to_wp
 
 router = Router()
+router.message.outer_middleware(AccessMiddleware())
 router.message.outer_middleware(AlbumMiddleware())
 logger = logging.getLogger(__name__)
 
@@ -122,10 +122,6 @@ async def _ask_publish(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    if message.from_user.id not in ALLOWED_USERS:
-        await message.answer("У вас нет доступа к публикации.")
-        return
-
     await state.clear()
     await message.answer(
         "Привет! Введите <b>заголовок</b> поста.\n"
@@ -158,10 +154,6 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(StateFilter(None), F.text & ~F.text.startswith("/"))
 async def quick_post_text(message: Message, state: FSMContext) -> None:
-    if message.from_user.id not in ALLOWED_USERS:
-        await message.answer("У вас нет доступа к публикации.")
-        return
-
     raw = (message.html_text or message.text or "").replace(_MORE_MARKER, _MORE_TAG)
     title, body = _split_title_body(raw)
     if not title:
@@ -180,10 +172,6 @@ async def quick_post_media(
     bot: Bot,
     album: list[Message] | None = None,
 ) -> None:
-    if message.from_user.id not in ALLOWED_USERS:
-        await message.answer("У вас нет доступа к публикации.")
-        return
-
     # подпись Telegram прикрепляет к первому фото группы (мин. message_id)
     src = min(album, key=lambda m: m.message_id) if album else message
     raw = (src.html_text or src.caption or "").replace(_MORE_MARKER, _MORE_TAG)
